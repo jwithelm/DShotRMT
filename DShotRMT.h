@@ -12,20 +12,59 @@
 // The RMT (Remote Control) module library is used for generating the DShot signal.
 #include <driver/rmt.h>
 
+// Stuff taken from betaflight:
+static constexpr int DSHOT_MAX_COMMAND{47};
+static constexpr int DSHOT_PROTOCOL_DETECTION_DELAY_MS{3000};
+static constexpr int DSHOT_INITIAL_DELAY_US{10000};
+static constexpr int DSHOT_COMMAND_DELAY_US{1000};
+static constexpr int DSHOT_ESCINFO_DELAY_US{12000};
+static constexpr int DSHOT_BEEP_DELAY_US{100000};
+
+
+
+
+// 3D-Mode: positive direction
+static constexpr int DSHOT3D_THROTTLE_N_MIN{48};
+static constexpr int DSHOT3D_THROTTLE_N_MAX{1047};
+
+// 3D-Mode: negative direction
+static constexpr int DSHOT3D_THROTTLE_R_MIN{1048};
+static constexpr int DSHOT3D_THROTTLE_R_MAX{2047};
+
+static constexpr int DSHOT3D_RANGE = DSHOT3D_THROTTLE_N_MAX - DSHOT3D_THROTTLE_N_MIN;
+static constexpr float DSHOT3D_SLOPE = DSHOT3D_RANGE / 100.0F;
+
+// Normal-Mode
+static constexpr int DSHOT_THROTTLE_MIN{48};
+static constexpr int DSHOT_THROTTLE_MAX{2047};
+
+static constexpr int DSHOT_RANGE = DSHOT_THROTTLE_MAX - DSHOT_THROTTLE_MIN;
+static constexpr float DSHOT_SLOPE = DSHOT_RANGE / 100.0F;
+
 // Defines the library version
 constexpr auto DSHOT_LIB_VERSION = "0.2.4";
 
 // Constants related to the DShot protocol
-constexpr auto DSHOT_CLK_DIVIDER = 8;    // Slow down RMT clock to 0.1 microseconds / 100 nanoseconds per cycle
-constexpr auto DSHOT_PACKET_LENGTH = 17; // Last pack is the pause
-constexpr auto DSHOT_THROTTLE_MIN = 48;
-constexpr auto DSHOT_THROTTLE_MAX = 2047;
+constexpr auto DSHOT_CLK_DIVIDER = 8;    // Slow down RMT clock to 0.1 microseconds / 100 nanoseconds per cycle -> 80 MHz/8: 10 MHz
+constexpr auto DSHOT_PACKET_LENGTH = 17; // 16 bits + Last pack is the pause
 constexpr auto DSHOT_NULL_PACKET = 0b0000000000000000;
 constexpr auto DSHOT_PAUSE = 21; // 21-bit is recommended
 constexpr auto DSHOT_PAUSE_BIT = 16;
 constexpr auto F_CPU_RMT = APB_CLK_FREQ;
 constexpr auto RMT_CYCLES_PER_SEC = (F_CPU_RMT / DSHOT_CLK_DIVIDER);
 constexpr auto RMT_CYCLES_PER_ESP_CYCLE = (F_CPU / RMT_CYCLES_PER_SEC);
+
+// DShot frame time, taken from https://brushlesswhoop.com/dshot-and-bidirectional-dshot/#frame-structure, rounded to integers
+// ToDo: Calculate from or synchronize with DShot timings in this library
+static constexpr int dshot_frame_us[] = {
+    0,
+    107,
+    53,
+    27,
+    13
+};
+
+static constexpr int telemetry_frame_us = 1.5 * 868;
 
 // Enumeration for the DShot mode
 typedef enum dshot_mode_e
@@ -114,6 +153,22 @@ typedef enum dshot_cmd_e
     DSHOT_CMD_MAX = 47
 } dshot_cmd_t;
 
+// Telemetry data packages
+typedef struct ESCTelemetry
+{
+    float temperature;
+    float voltage;
+    float current;
+    float consumption;
+    float RPM;
+} ESCTelemetry_t;
+
+typedef struct ESCTelemetryPackage
+{
+    unsigned long timestamp_us;
+    ESCTelemetry_t data;
+} ESCTelemetryPackage_t;
+
 // The main DShotRMT class
 class DShotRMT
 {
@@ -122,11 +177,15 @@ public:
     DShotRMT(gpio_num_t gpio, rmt_channel_t rmtChannel);
     DShotRMT(uint8_t pin, uint8_t channel);
 
+    DShotRMT(gpio_num_t gpio, rmt_channel_t rmtChannel, HardwareSerial *bus, const int8_t rxpin, const int8_t txpin);
+
     // Destructor for the DShotRMT class
     ~DShotRMT();
 
     // Copy constructor for the DShotRMT class
     DShotRMT(DShotRMT const &);
+
+    void setup(bool is_3D, uint8_t motor_poles);
 
     // The begin() function initializes the DShotRMT class with
     // a given DShot mode (DSHOT_OFF, DSHOT150, DSHOT300, DSHOT600, DSHOT1200)
@@ -138,12 +197,56 @@ public:
     // throttle value (between 49 and 2047) and an optional telemetry
     // request flag.
     // void sendThrottleValue(uint16_t throttle_value, telemetric_request_t telemetric_request = NO_TELEMETRIC);
-    void sendThrottleValue(uint16_t throttle_value);
+    void send_throttle_raw(uint16_t);
+
+    void send_throttle(float);
+
+    float read(void) {return m_throttle_des;};
+
+    void send_cmd(uint16_t cmd, bool telem);
+
+    bool set_3D_mode(bool);
+
+    bool is_enabled(void) {return m_is_enabled;};
+    void enable(void);
+    void disable(void);
+
+    ESCTelemetryPackage_t get_telemetry(void);
+
+    // void enable();
+    // void disable();
+
+    int8_t is_tx_finished(void);
+
+    float m_throttle_des{0.0F};
+    uint16_t m_throttle_cmd{48};
 
 private:
     rmt_item32_t dshot_tx_rmt_item[DSHOT_PACKET_LENGTH]; // An array of RMT items used to send a DShot packet.
     rmt_config_t dshot_tx_rmt_config;                    // The RMT configuration used for sending DShot packets.
     dshot_config_t dshot_config;                         // The configuration for the DShot mode.
+
+    bool m_is_3D {false};
+    bool m_is_enabled {false};
+
+    // Telemetry
+    HardwareSerial *m_telem_uart {nullptr};
+    int8_t m_telem_rxpin {-1};
+    int8_t m_telem_txpin {-1};
+    bool m_telem_enabled {false};
+    uint8_t m_serial_buffer[10];
+    uint8_t m_received_bytes {0U};
+    ESCTelemetryPackage_t m_telem_data { };
+    unsigned long m_telem_timestamp_us {0UL};
+    bool m_telem_requested {false};
+    uint8_t m_motor_poles {14U};
+    uint8_t get_crc8(uint8_t *Buf, uint8_t BufLen);
+    uint8_t update_crc8(uint8_t crc, uint8_t crc_seed);
+    void receive_telemetry(void);
+
+    dshot_packet_t generate_dshot_packet(uint16_t, telemetric_request_t);
+    dshot_packet_t generate_dshot_packet(uint16_t);
+    void send_dshot(void);
 
     rmt_item32_t *buildTxRmtItem(uint16_t parsed_packet);       // Constructs an RMT item from a parsed DShot packet.
     uint16_t calculateCRC(const dshot_packet_t &dshot_packet);  // Calculates the CRC checksum for a DShot packet.
